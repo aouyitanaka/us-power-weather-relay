@@ -263,8 +263,9 @@ def fetch_spp(hours: int) -> dict[str, pd.DataFrame]:
             r = requests.get(
                 f"https://portal.spp.org/file-browser-api/{fs}",
                 params={"path": "/"}, timeout=15)
+            log.info("spp fs=%s: %s %s", fs, r.status_code,
+                     r.text[:400] if r.ok else "")
             if r.ok and r.text.strip() not in ("", "[]", "{}"):
-                log.info("spp fs=%s /: %s", fs, r.text[:400])
                 found.append(fs)
         except Exception as e:  # noqa: BLE001
             log.info("spp fs=%s: %r", fs, e)
@@ -274,8 +275,8 @@ def fetch_spp(hours: int) -> dict[str, pd.DataFrame]:
                 r = requests.get(
                     f"https://portal.spp.org/file-browser-api/{fs}",
                     params={"path": p}, timeout=15)
-                if r.ok:
-                    log.info("spp fs=%s path=%s: %s", fs, p, r.text[:500])
+                log.info("spp fs=%s path=%s: %s %s", fs, p,
+                         r.status_code, r.text[:500])
             except Exception as e:  # noqa: BLE001
                 log.info("spp fs=%s path=%s: %r", fs, p, e)
 
