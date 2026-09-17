@@ -1,0 +1,34 @@
+# ISO data relay — GH-hosted runners sit in US Azure regions, so ISO
+# endpoints geo-blocked from the main project's deploy host (ERCOT misapp
+# servlets, portal.spp.org) are reachable here. Hourly: pull recent ERCOT
+# DA/RT/ORDC/AS + SPP/PJM DA data, commit rolling CSVs to data/relay/.
+name: iso-relay
+on:
+  schedule:
+    - cron: "17 * * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install "gridstatus>=0.34,<0.35" pytz requests pandas
+      - name: Fetch ISO data
+        env:
+          PJM_API_KEY: ${{ secrets.PJM_API_KEY }}
+        run: python scripts/relay_fetch.py --hours 48
+      - name: Commit relay CSVs
+        run: |
+          git config user.name "iso-relay[bot]"
+          git config user.email "iso-relay@users.noreply.github.com"
+          git add data/relay/
+          git diff --cached --quiet || \
+            git commit -m "relay: ISO data refresh $(date -u +%Y-%m-%dT%H:%MZ)"
+          git push
