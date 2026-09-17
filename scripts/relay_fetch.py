@@ -3,36 +3,111 @@
 ISO endpoints (ERCOT misapp servlets, portal.spp.org) are reachable.
 
 Pulls recent ERCOT DA/RT prices, ORDC adders + reserves, ancillary-service
-prices, and SPP/PJM DA prices via gridstatus; appends to per-file CSVs under
-data/relay/ which the workflow commits back. Consumers read them via
-raw.githubusercontent.com (see USP_RELAY_BASE in the main project).
+prices, and SPP/PJM data; appends to per-file CSVs under data/relay/ which
+the workflow commits back. Consumers read them via raw.githubusercontent.com
+(see USP_RELAY_BASE in the main project).
 
 Usage:  python scripts/relay_fetch.py [--hours 48] [--out data/relay]
 """
 from __future__ import annotations
 
 import argparse
+import io
 import logging
 import os
+import zipfile
 
 import pandas as pd
+import requests
 
 log = logging.getLogger("relay")
+
+ERCOT_DOCLIST = ("https://www.ercot.com/misapp/servlets/IceDocListJsonWS"
+                 "?reportTypeId={rtid}")
+ERCOT_DOC_DL = ("https://www.ercot.com/misdownload/servlets/mirDownload"
+                "?doclookupId={did}")
+
+# ERCOT public report type ids (misapp IceDocListJsonWS)
+RTID_ORDC = 13221        # NP6-323-CD  Real-Time Price Adders by SCED
+RTID_DAM_SPP = 12331     # NP4-190-CD  DAM Settlement Point Prices
+RTID_RTM_SPP = 13001     # NP6-905-CD  RTM Settlement Point Prices
 
 ERCOT_HUBS = {"HB_NORTH", "HB_SOUTH", "HB_WEST", "HB_HOUSTON"}
 
 
-def _hourly_hub_mean(df: pd.DataFrame, ts_col: str, val_col: str,
-                     loc_col: str | None = None,
-                     hubs: set | None = None) -> pd.Series:
-    if loc_col and hubs and loc_col in df.columns:
-        sub = df[df[loc_col].isin(hubs)]
+def _ercot_docs(rtid: int, max_docs: int = 6) -> list[dict]:
+    """Latest N docs for an ERCOT misapp report type."""
+    r = requests.get(ERCOT_DOCLIST.format(rtid=rtid), timeout=30)
+    r.raise_for_status()
+    docs = (r.json().get("ListDocsByRptTypeRes", {})
+            .get("DocumentList", []))
+    out = []
+    for d in docs[-max_docs:]:
+        doc = d.get("Document", {})
+        did = doc.get("DocLookupId") or doc.get("DocumentId")
+        if did:
+            out.append({"id": did, "name": doc.get("DocName", "")})
+    return out
+
+
+def _ercot_read_doc(did) -> pd.DataFrame:
+    """Download one ERCOT doc (zip-wrapped csv) -> DataFrame."""
+    r = requests.get(ERCOT_DOC_DL.format(did=did), timeout=60)
+    r.raise_for_status()
+    blob = io.BytesIO(r.content)
+    if r.content[:2] == b"PK":
+        with zipfile.ZipFile(blob) as z:
+            name = next(n for n in z.namelist() if n.lower().endswith(".csv"))
+            return pd.read_csv(z.open(name))
+    return pd.read_csv(blob)
+
+
+def fetch_ercot_ordc(hours: int) -> pd.DataFrame:
+    """Direct misapp fetch of NP6-323-CD (gridstatus's handler has a
+    list.remove bug on the post-RTC+B doc set)."""
+    frames = []
+    for d in _ercot_docs(RTID_ORDC, max_docs=3):
+        try:
+            df = _ercot_read_doc(d["id"])
+            df.columns = df.columns.str.strip()
+            frames.append(df)
+        except Exception as e:  # noqa: BLE001
+            log.warning("ordc doc %s: %s", d["name"], e)
+    if not frames:
+        return pd.DataFrame()
+    out = pd.concat(frames, ignore_index=True)
+    ts_col = next((c for c in out.columns if "SCED" in c or "Time" in c), None)
+    if ts_col:
+        # ERCOT stamps are US/Central local time
+        out["ts_utc"] = pd.to_datetime(
+            out[ts_col]).dt.tz_localize("US/Central",
+                                        ambiguous=True,
+                                        nonexistent="shift_forward") \
+            .dt.tz_convert("UTC")
+    return out
+
+
+def _ercot_spp(rtid: int, hubs_only: bool) -> pd.DataFrame:
+    frames = []
+    for d in _ercot_docs(rtid, max_docs=3):
+        try:
+            df = _ercot_read_doc(d["id"])
+            df.columns = df.columns.str.strip()
+            frames.append(df)
+        except Exception as e:  # noqa: BLE001
+            log.warning("spp doc %s: %s", d["name"], e)
+    if not frames:
+        return pd.DataFrame()
+    df = pd.concat(frames, ignore_index=True)
+    loc = next((c for c in df.columns if "Settlement" in c or
+                c in ("Location", "SettlementPoint")), None)
+    px = next((c for c in df.columns if c.upper() in
+               ("SPP", "LMP", "SETTLEMENTPOINTPRICE")), None)
+    if loc and px and hubs_only:
+        sub = df[df[loc].isin(ERCOT_HUBS)]
         if not sub.empty:
             df = sub
-    s = (df.assign(ts_utc=pd.to_datetime(df[ts_col], utc=True))
-           .groupby(pd.Grouper(key="ts_utc", freq="1h"))[val_col]
-           .mean().dropna())
-    return s
+    return df
 
 
 def fetch_ercot(hours: int) -> dict[str, pd.DataFrame]:
@@ -41,45 +116,82 @@ def fetch_ercot(hours: int) -> dict[str, pd.DataFrame]:
     iso = gridstatus.Ercot()
     start = pd.Timestamp.now(tz="UTC") - pd.Timedelta(hours=hours)
     today = pd.Timestamp.now(tz="UTC").date()
-    start_d = (start - pd.Timedelta(days=1)).date()  # DA posts a day ahead
+    start_d = (start - pd.Timedelta(days=1)).date()
     out: dict[str, pd.DataFrame] = {}
 
+    # DAM settlement-point prices (hub mean, hourly)
     try:
-        da = iso.get_dam_spp(date=str(start_d), end=str(today))
-        # Settlement Point col carries hub names; SPP is the price
-        loc = next((c for c in ("Settlement Point", "Location")
-                    if c in da.columns), None)
-        s = _hourly_hub_mean(da, "Time", "SPP", loc, ERCOT_HUBS)
+        da = iso.get_spp(date=str(start_d), end=str(today),
+                         market="DAY_AHEAD_HOURLY", location_type="Hub")
+        ts_col = next((c for c in ("Interval Start", "Time")
+                       if c in da.columns), None)
+        px_col = next((c for c in ("SPP", "LMP") if c in da.columns), None)
+        s = (da.assign(ts_utc=pd.to_datetime(da[ts_col], utc=True))
+               .groupby(pd.Grouper(key="ts_utc", freq="1h"))[px_col]
+               .mean().dropna())
         out["ercot_da"] = s.rename("day_ahead_usd_mwh").reset_index()
     except Exception as e:  # noqa: BLE001
-        log.warning("ercot dam_spp: %s", e)
+        log.warning("ercot dam via get_spp: %s", e)
+        try:  # direct misapp fallback
+            df = _ercot_spp(RTID_DAM_SPP, hubs_only=True)
+            if not df.empty:
+                loc = next(c for c in df.columns if "Settlement" in c)
+                px = next(c for c in df.columns
+                          if c.upper() in ("SPP", "LMP"))
+                tc = next((c for c in df.columns
+                           if "Delivery" in c or "Time" in c), None)
+                if tc:
+                    df["ts_utc"] = pd.to_datetime(df[tc]).dt.tz_localize(
+                        "US/Central", ambiguous=True,
+                        nonexistent="shift_forward").dt.tz_convert("UTC")
+                    out["ercot_da"] = (df.groupby(
+                        pd.Grouper(key="ts_utc", freq="1h"))[px]
+                        .mean().dropna()
+                        .rename("day_ahead_usd_mwh").reset_index())
+        except Exception as e2:  # noqa: BLE001
+            log.warning("ercot dam direct: %s", e2)
 
+    # RTM settlement-point prices (hub mean, native 15-min)
     try:
-        rt = iso.get_rtm_spp(date=str(start.date()), end=str(today))
-        loc = next((c for c in ("Settlement Point", "Location")
-                    if c in rt.columns), None)
-        # keep native 15-min granularity for the spike module
-        sub = rt[rt[loc].isin(ERCOT_HUBS)] if loc else rt
-        sub = (sub.assign(ts_utc=pd.to_datetime(sub["Time"], utc=True))
-                  .groupby(pd.Grouper(key="ts_utc", freq="15min"))
-                  [["SPP"]].mean().dropna().reset_index()
-                  .rename(columns={"SPP": "realtime_usd_mwh"}))
-        out["ercot_rt"] = sub
+        rt = iso.get_spp(date=str(start.date()), end=str(today),
+                         market="REAL_TIME_15_MIN", location_type="Hub")
+        ts_col = next((c for c in ("Interval Start", "Time")
+                       if c in rt.columns), None)
+        px_col = next((c for c in ("SPP", "LMP") if c in rt.columns), None)
+        out["ercot_rt"] = (rt.assign(
+            ts_utc=pd.to_datetime(rt[ts_col], utc=True))
+            .groupby(pd.Grouper(key="ts_utc", freq="15min"))[px_col]
+            .mean().dropna().rename("realtime_usd_mwh").reset_index())
     except Exception as e:  # noqa: BLE001
-        log.warning("ercot rtm_spp: %s", e)
+        log.warning("ercot rtm via get_spp: %s", e)
+        try:
+            df = _ercot_spp(RTID_RTM_SPP, hubs_only=True)
+            if not df.empty:
+                px = next(c for c in df.columns
+                          if c.upper() in ("SPP", "LMP"))
+                tc = next((c for c in df.columns
+                           if "SCED" in c or "Time" in c), None)
+                if tc:
+                    df["ts_utc"] = pd.to_datetime(df[tc]).dt.tz_localize(
+                        "US/Central", ambiguous=True,
+                        nonexistent="shift_forward").dt.tz_convert("UTC")
+                    out["ercot_rt"] = (df.groupby(
+                        pd.Grouper(key="ts_utc", freq="15min"))[px]
+                        .mean().dropna()
+                        .rename("realtime_usd_mwh").reset_index())
+        except Exception as e2:  # noqa: BLE001
+            log.warning("ercot rtm direct: %s", e2)
 
+    # ORDC adders + reserves — direct misapp (gridstatus handler broken
+    # post-RTC+B)
     try:
-        ordc = iso.get_real_time_adders_and_reserves(
-            date=str(start.date()), end=str(today))
-        ts_col = next((c for c in ("Time", "SCED Timestamp",
-                                   "Interval Start") if c in ordc.columns),
-                      None)
-        if ts_col:
-            ordc["ts_utc"] = pd.to_datetime(ordc[ts_col], utc=True)
+        ordc = fetch_ercot_ordc(hours)
+        if not ordc.empty:
             out["ercot_ordc"] = ordc
     except Exception as e:  # noqa: BLE001
         log.warning("ercot ordc: %s", e)
 
+    # Ancillary-service prices (gridstatus path works)
     try:
         asp = iso.get_as_prices(date=str(start.date()), end=str(today))
         ts_col = next((c for c in ("Time", "Interval Start")
@@ -93,16 +205,43 @@ def fetch_ercot(hours: int) -> dict[str, pd.DataFrame]:
     return out
 
 
-def fetch_spp_da(hours: int) -> pd.DataFrame:
+def fetch_spp(hours: int) -> dict[str, pd.DataFrame]:
+    """SPP DA + RT-5min via gridstatus (portal.spp.org reachable from
+    US runners). Post-RTC+B filename changes may 404 some reports — each
+    path is tried independently."""
     import gridstatus
 
     iso = gridstatus.SPP()
     start = pd.Timestamp.now(tz="UTC") - pd.Timedelta(hours=hours)
-    df = iso.get_lmp_day_ahead_hourly(date=str(start.date()),
-                                    end=str(pd.Timestamp.now(tz="UTC").date()),
-                                    location_type="Hub")
-    s = _hourly_hub_mean(df, "Interval Start", "LMP")
-    return s.rename("day_ahead_usd_mwh").reset_index()
+    today = pd.Timestamp.now(tz="UTC").date()
+    out = {}
+
+    try:
+        df = iso.get_lmp_day_ahead_hourly(date=str(start.date()),
+                                        end=str(today),
+                                        location_type="Hub")
+        s = (df.assign(ts_utc=pd.to_datetime(df["Interval Start"], utc=True))
+               .groupby(pd.Grouper(key="ts_utc", freq="1h"))["LMP"]
+               .mean().dropna())
+        out["spp_da"] = s.rename("day_ahead_usd_mwh").reset_index()
+    except Exception as e:  # noqa: BLE001
+        log.warning("spp da: %s", e)
+
+    try:
+        df = iso.get_lmp_real_time_5_min_by_location(
+            date=str(start.date()), end=str(today), location_type="Hub",
+            use_daily_files=True)
+        ts_col = next((c for c in ("Interval Start", "GMTIntervalEnd",
+                                   "Time") if c in df.columns), None)
+        px_col = next((c for c in ("LMP", "SPP") if c in df.columns), None)
+        out["spp_rt"] = (df.assign(
+            ts_utc=pd.to_datetime(df[ts_col], utc=True))
+            .groupby(pd.Grouper(key="ts_utc", freq="15min"))[px_col]
+            .mean().dropna().rename("realtime_usd_mwh").reset_index())
+    except Exception as e:  # noqa: BLE001
+        log.warning("spp rt5: %s", e)
+
+    return out
 
 
 def fetch_pjm_da(hours: int) -> pd.DataFrame:
@@ -117,14 +256,15 @@ def fetch_pjm_da(hours: int) -> pd.DataFrame:
                      end=str(pd.Timestamp.now(tz="UTC").date()),
                      market="DAY_AHEAD_HOURLY")
     lt = next((c for c in ("Location Type",) if c in df.columns), None)
-    pref = {"HUB", "ZONE", "AGGREGATE", "Hub", "Zone"}
     if lt:
-        sub = df[df[lt].isin(pref)]
+        sub = df[df[lt].isin({"HUB", "ZONE", "AGGREGATE", "Hub", "Zone"})]
         if not sub.empty:
             df = sub
     ts_col = next((c for c in ("Interval Start", "Time") if c in df.columns),
                   None)
-    s = _hourly_hub_mean(df, ts_col, "LMP")
+    s = (df.assign(ts_utc=pd.to_datetime(df[ts_col], utc=True))
+           .groupby(pd.Grouper(key="ts_utc", freq="1h"))["LMP"]
+           .mean().dropna())
     return s.rename("day_ahead_usd_mwh").reset_index()
 
 
@@ -154,15 +294,18 @@ def main() -> None:
         _append_csv(f"{args.out}/{name}.csv", df)
         log.info("%s: %d rows", name, len(df))
 
-    for name, fn in (("spp_da", fetch_spp_da), ("pjm_da", fetch_pjm_da)):
-        try:
-            df = fn(args.hours)
-        except Exception as e:  # noqa: BLE001
-            log.warning("%s: %s", name, e)
-            continue
+    for name, df in fetch_spp(args.hours).items():
         if not df.empty:
             _append_csv(f"{args.out}/{name}.csv", df)
             log.info("%s: %d rows", name, len(df))
+
+    try:
+        pjm = fetch_pjm_da(args.hours)
+        if not pjm.empty:
+            _append_csv(f"{args.out}/pjm_da.csv", pjm)
+            log.info("pjm_da: %d rows", len(pjm))
+    except Exception as e:  # noqa: BLE001
+        log.warning("pjm_da: %s", e)
 
 
 if __name__ == "__main__":
