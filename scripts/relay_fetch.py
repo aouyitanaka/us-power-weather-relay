@@ -249,17 +249,32 @@ def fetch_spp(hours: int) -> dict[str, pd.DataFrame]:
     today = pd.Timestamp.now(tz="UTC").date()
     out = {}
 
-    # probe the file-browser listing API — post-RTC+B filenames 404 the
-    # gridstatus patterns; walk the tree to reveal the real names.
-    # correct shape (per gridstatus): GET {api}/{fs}?path={path}
-    for fs in ("da-lmp-by-location", "rtbm-lmp-by-location"):
-        for p in ("/", "/2026/", "/2026/09/", "/2026/09/By_Day/",
-                  "/2026/09/By_Day/16/", "/2026/09/By_Day/17/"):
+    # probe the file-browser listing API — post-RTC+B names 404 the
+    # gridstatus patterns. Sweep candidate fs names at the year path to
+    # discover the live endpoint names, then descend one level.
+    cands = ("da-lmp-by-location", "rtbm-lmp-by-location",
+             "da-lmp-by-bus", "rtbm-lmp-by-bus",
+             "dam-lmp-by-location", "lmp-by-location",
+             "da-lmp", "rtbm-lmp", "dam-lmp", "rtbm-lmp-by-sl",
+             "da-lmp-by-sl", "lmp-by-settlement-location")
+    found = []
+    for fs in cands:
+        try:
+            r = requests.get(
+                f"https://portal.spp.org/file-browser-api/{fs}",
+                params={"path": "/"}, timeout=15)
+            if r.ok and r.text.strip() not in ("", "[]", "{}"):
+                log.info("spp fs=%s /: %s", fs, r.text[:400])
+                found.append(fs)
+        except Exception as e:  # noqa: BLE001
+            log.info("spp fs=%s: %r", fs, e)
+    for fs in found[:4]:
+        for p in ("/2026/09/By_Day/", "/2026/09/"):
             try:
                 r = requests.get(
                     f"https://portal.spp.org/file-browser-api/{fs}",
-                    params={"path": p}, timeout=20)
-                if r.ok and r.text.strip() not in ("", "[]", "{}"):
+                    params={"path": p}, timeout=15)
+                if r.ok:
                     log.info("spp fs=%s path=%s: %s", fs, p, r.text[:500])
             except Exception as e:  # noqa: BLE001
                 log.info("spp fs=%s path=%s: %r", fs, p, e)
