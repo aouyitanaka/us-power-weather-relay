@@ -5,7 +5,9 @@
 name: iso-relay
 on:
   schedule:
-    - cron: "17 * * * *"
+    # every 15min — SPP post-RTC+B only exposes -latestInterval.csv
+    # snapshots (no dated archive), so frequent polling is the archive
+    - cron: "*/15 * * * *"
   workflow_dispatch: {}
 
 permissions:

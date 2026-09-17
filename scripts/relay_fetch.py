@@ -33,6 +33,7 @@ RTID_DAM_SPP = 12331     # NP4-190-CD  DAM Settlement Point Prices
 RTID_RTM_SPP = 13001     # NP6-905-CD  RTM Settlement Point Prices
 
 ERCOT_HUBS = {"HB_NORTH", "HB_SOUTH", "HB_WEST", "HB_HOUSTON"}
+SPP_HUBS = {"SPPNORTH_HUB", "SPPSOUTH_HUB"}
 
 
 def _ercot_docs(rtid: int, max_docs: int = 6) -> list[dict]:
@@ -249,62 +250,52 @@ def fetch_spp(hours: int) -> dict[str, pd.DataFrame]:
     today = pd.Timestamp.now(tz="UTC").date()
     out = {}
 
-    # probe download endpoints directly — listing API shape is unclear,
-    # but -latestInterval.csv files are documented/still updating
-    d = pd.Timestamp.now(tz="UTC")
-    probes = [
-        ("rtbm-lmp-by-location", "/RTBM-LMP-SL-latestInterval.csv"),
-        ("rtbm-lmp-by-bus", "/RTBM-LMP-B-latestInterval.csv"),
-        ("rtbm-mcp", "/RTBM-MCP-latestInterval.csv"),
-        ("da-mcp", f"/{d:%Y}/{d:%m}/DA-MCP-{d:%Y%m%d}0100.csv"),
-        ("da-lmp-by-location",
-         f"/{d:%Y}/{d:%m}/By_Day/DA-LMP-SL-{d:%Y%m%d}0100.csv"),
-        ("rtbm-lmp-by-location",
-         f"/{d:%Y}/{d:%m}/By_Day/RTBM-LMP-DAILY-SL-{d:%Y%m%d}.csv"),
-        # By_Interval per-tick files (gridstatus pattern: /Y/M/By_Interval/DD/)
-        ("rtbm-lmp-by-location",
-         f"/{d:%Y}/{d:%m}/By_Interval/{d:%d}/RTBM-LMP-SL-{d:%Y%m%d%H%M}.csv"),
-        ("rtbm-lmp-by-location",
-         f"/{d:%Y}/{d:%m}/By_Interval/{d:%d}/RTBM-LMP-SL-"
-         f"{(d - pd.Timedelta(hours=1)):%Y%m%d%H%M}.csv"),
-        # DA-LMP dated file — maybe not under By_Day anymore
-        ("da-lmp-by-location",
-         f"/{d:%Y}/{d:%m}/DA-LMP-SL-{d:%Y%m%d}0100.csv"),
-    ]
-    for fs, p in probes:
-        try:
-            r = requests.get(
-                f"https://portal.spp.org/file-browser-api/download/{fs}",
-                params={"path": p}, timeout=20)
-            log.info("spp dl %s %s: %s %s", fs, p, r.status_code,
-                     r.text[:120].replace("\n", "|"))
-        except Exception as e:  # noqa: BLE001
-            log.info("spp dl %s %s: %r", fs, p, e)
+    # post-RTC+B SPP dropped dated By_Day/By_Interval archives — only the
+    # *-latestInterval.csv snapshots + dated MCP files remain. Relay polls
+    # latestInterval every 15min (cron) and accumulates ticks.
 
-    try:
-        df = iso.get_lmp_day_ahead_hourly(date=str(start.date()),
-                                        end=str(today),
-                                        location_type="Hub")
-        s = (df.assign(ts_utc=pd.to_datetime(df["Interval Start"], utc=True))
-               .groupby(pd.Grouper(key="ts_utc", freq="1h"))["LMP"]
-               .mean().dropna())
-        out["spp_da"] = s.rename("day_ahead_usd_mwh").reset_index()
-    except Exception as e:  # noqa: BLE001
-        log.warning("spp da: %s", e)
+    def _dl(fs: str, path: str) -> pd.DataFrame:
+        r = requests.get(
+            f"https://portal.spp.org/file-browser-api/download/{fs}",
+            params={"path": path}, timeout=30)
+        r.raise_for_status()
+        return pd.read_csv(io.BytesIO(r.content))
 
+    # RT 5-min settlement-location LMPs → hub rows
     try:
-        df = iso.get_lmp_real_time_5_min_by_location(
-            date=str(start.date()), end=str(today), location_type="Hub",
-            use_daily_files=True)
-        ts_col = next((c for c in ("Interval Start", "GMTIntervalEnd",
-                                   "Time") if c in df.columns), None)
-        px_col = next((c for c in ("LMP", "SPP") if c in df.columns), None)
-        out["spp_rt"] = (df.assign(
-            ts_utc=pd.to_datetime(df[ts_col], utc=True))
-            .groupby(pd.Grouper(key="ts_utc", freq="15min"))[px_col]
-            .mean().dropna().rename("realtime_usd_mwh").reset_index())
+        df = _dl("rtbm-lmp-by-location", "/RTBM-LMP-SL-latestInterval.csv")
+        loc_col = next(c for c in df.columns if "Settlement" in c or
+                       c == "Location")
+        hubs = df[df[loc_col].astype(str).str.contains("HUB", na=False)]
+        if hubs.empty:
+            hubs = df[df[loc_col].isin(SPP_HUBS)]
+        if hubs.empty:
+            raise ValueError(f"no hub rows; sample locs: "
+                             f"{df[loc_col].unique()[:15]}")
+        out["spp_rt"] = (hubs.assign(
+            ts_utc=pd.to_datetime(hubs["GMTIntervalEnd"], utc=True))
+            .groupby("ts_utc")["LMP"].mean()
+            .rename("realtime_usd_mwh").reset_index())
+        log.info("spp_rt latest interval: %d hub rows", len(hubs))
     except Exception as e:  # noqa: BLE001
-        log.warning("spp rt5: %s", e)
+        log.warning("spp rt latest: %r", e)
+
+    # RT 5-min market clearing prices (per reserve zone)
+    try:
+        df = _dl("rtbm-mcp", "/RTBM-MCP-latestInterval.csv")
+        df["ts_utc"] = pd.to_datetime(df["GMTIntervalEnd"], utc=True)
+        out["spp_mcp"] = df
+    except Exception as e:  # noqa: BLE001
+        log.warning("spp rtbm mcp: %r", e)
+
+    # DA market clearing prices (posted ~01:00 CT daily)
+    try:
+        d = pd.Timestamp.now(tz="UTC")
+        df = _dl("da-mcp", f"/{d:%Y}/{d:%m}/DA-MCP-{d:%Y%m%d}0100.csv")
+        df["ts_utc"] = pd.to_datetime(df["GMTIntervalEnd"], utc=True)
+        out["spp_damcp"] = df
+    except Exception as e:  # noqa: BLE001
+        log.warning("spp da mcp: %r", e)
 
     return out
 
@@ -344,6 +335,29 @@ def _append_csv(path: str, new: pd.DataFrame, key: str = "ts_utc",
     new.to_csv(path, index=False)
 
 
+def _merge_zone(out_dir: str, da_name: str | None,
+                rt_name: str | None) -> pd.DataFrame | None:
+    """Join accumulated <zone>_da.csv + <zone>_rt.csv into the single
+    <zone>.csv consumed by usp.sources.fetch_relay (hourly, UTC)."""
+    da = rt = None
+    if da_name and os.path.exists(f"{out_dir}/{da_name}.csv"):
+        da = pd.read_csv(f"{out_dir}/{da_name}.csv", parse_dates=["ts_utc"])
+    if rt_name and os.path.exists(f"{out_dir}/{rt_name}.csv"):
+        rt = pd.read_csv(f"{out_dir}/{rt_name}.csv", parse_dates=["ts_utc"])
+        rt = (rt.set_index("ts_utc")
+              .resample("1h")["realtime_usd_mwh"].mean().reset_index())
+    if da is None and rt is None:
+        return None
+    if da is None:
+        m = rt
+    elif rt is None:
+        m = da
+    else:
+        m = da.merge(rt, on="ts_utc", how="outer").sort_values("ts_utc")
+    m["ts_utc"] = pd.to_datetime(m["ts_utc"], utc=True)
+    return m
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--hours", type=int, default=48)
@@ -371,6 +385,18 @@ def main() -> None:
             log.info("pjm_da: %d rows", len(pjm))
     except Exception as e:  # noqa: BLE001
         log.warning("pjm_da: %s", e)
+
+    # merged <zone>.csv = the contract fetch_relay() reads (hourly DA+RT)
+    for zone, da_f, rt_f in (("ercot", "ercot_da", "ercot_rt"),
+                             ("spp", None, "spp_rt"),
+                             ("pjm", "pjm_da", None)):
+        try:
+            merged = _merge_zone(args.out, da_f, rt_f)
+            if merged is not None and not merged.empty:
+                merged.to_csv(f"{args.out}/{zone}.csv", index=False)
+                log.info("%s.csv: %d rows", zone, len(merged))
+        except Exception as e:  # noqa: BLE001
+            log.warning("merge %s: %r", zone, e)
 
 
 if __name__ == "__main__":
