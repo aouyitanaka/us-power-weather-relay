@@ -249,36 +249,28 @@ def fetch_spp(hours: int) -> dict[str, pd.DataFrame]:
     today = pd.Timestamp.now(tz="UTC").date()
     out = {}
 
-    # probe the file-browser listing API — post-RTC+B names 404 the
-    # gridstatus patterns. Sweep candidate fs names at the year path to
-    # discover the live endpoint names, then descend one level.
-    cands = ("da-lmp-by-location", "rtbm-lmp-by-location",
-             "da-lmp-by-bus", "rtbm-lmp-by-bus",
-             "dam-lmp-by-location", "lmp-by-location",
-             "da-lmp", "rtbm-lmp", "dam-lmp", "rtbm-lmp-by-sl",
-             "da-lmp-by-sl", "lmp-by-settlement-location")
-    found = []
-    for fs in cands:
+    # probe download endpoints directly — listing API shape is unclear,
+    # but -latestInterval.csv files are documented/still updating
+    d = pd.Timestamp.now(tz="UTC")
+    probes = [
+        ("rtbm-lmp-by-location", "/RTBM-LMP-SL-latestInterval.csv"),
+        ("rtbm-lmp-by-bus", "/RTBM-LMP-B-latestInterval.csv"),
+        ("rtbm-mcp", "/RTBM-MCP-latestInterval.csv"),
+        ("da-mcp", f"/{d:%Y}/{d:%m}/DA-MCP-{d:%Y%m%d}0100.csv"),
+        ("da-lmp-by-location",
+         f"/{d:%Y}/{d:%m}/By_Day/DA-LMP-SL-{d:%Y%m%d}0100.csv"),
+        ("rtbm-lmp-by-location",
+         f"/{d:%Y}/{d:%m}/By_Day/RTBM-LMP-DAILY-SL-{d:%Y%m%d}.csv"),
+    ]
+    for fs, p in probes:
         try:
             r = requests.get(
-                f"https://portal.spp.org/file-browser-api/{fs}",
-                params={"path": "/"}, timeout=15)
-            log.info("spp fs=%s: %s %s", fs, r.status_code,
-                     r.text[:400] if r.ok else "")
-            if r.ok and r.text.strip() not in ("", "[]", "{}"):
-                found.append(fs)
+                f"https://portal.spp.org/file-browser-api/download/{fs}",
+                params={"path": p}, timeout=20)
+            log.info("spp dl %s %s: %s %s", fs, p, r.status_code,
+                     r.text[:120].replace("\n", "|"))
         except Exception as e:  # noqa: BLE001
-            log.info("spp fs=%s: %r", fs, e)
-    for fs in found[:4]:
-        for p in ("/2026/09/By_Day/", "/2026/09/"):
-            try:
-                r = requests.get(
-                    f"https://portal.spp.org/file-browser-api/{fs}",
-                    params={"path": p}, timeout=15)
-                log.info("spp fs=%s path=%s: %s %s", fs, p,
-                         r.status_code, r.text[:500])
-            except Exception as e:  # noqa: BLE001
-                log.info("spp fs=%s path=%s: %r", fs, p, e)
+            log.info("spp dl %s %s: %r", fs, p, e)
 
     try:
         df = iso.get_lmp_day_ahead_hourly(date=str(start.date()),
