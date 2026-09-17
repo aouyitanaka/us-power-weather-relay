@@ -36,18 +36,26 @@ ERCOT_HUBS = {"HB_NORTH", "HB_SOUTH", "HB_WEST", "HB_HOUSTON"}
 
 
 def _ercot_docs(rtid: int, max_docs: int = 6) -> list[dict]:
-    """Latest N docs for an ERCOT misapp report type."""
+    """Newest-first N docs for an ERCOT misapp report type (sorted by
+    PublishDate desc — the raw list order is not chronological)."""
     r = requests.get(ERCOT_DOCLIST.format(rtid=rtid), timeout=30)
     r.raise_for_status()
     docs = (r.json().get("ListDocsByRptTypeRes", {})
             .get("DocumentList", []))
+
+    def _pub(d):
+        try:
+            return pd.Timestamp(d.get("Document", {}).get("PublishDate"))
+        except Exception:
+            return pd.Timestamp.min
+    docs = sorted(docs, key=_pub, reverse=True)
     out = []
-    for d in docs[-max_docs:]:
+    for d in docs[:max_docs]:
         doc = d.get("Document", {})
         did = doc.get("DocID") or doc.get("DocLookupId")
         if did:
             out.append({"id": did, "name": doc.get("DocName", "")})
-    log.info("rtid %s: %d docs, using last %d", rtid, len(docs), len(out))
+    log.info("rtid %s: %d docs, using newest %d", rtid, len(docs), len(out))
     return out
 
 
@@ -67,13 +75,14 @@ def fetch_ercot_ordc(hours: int) -> pd.DataFrame:
     """Direct misapp fetch of NP6-323-CD (gridstatus's handler has a
     list.remove bug on the post-RTC+B doc set)."""
     frames = []
-    for d in _ercot_docs(RTID_ORDC, max_docs=3):
+    # each doc is one SCED tick (~1 row) — fetch a slice covering ~8h
+    for d in _ercot_docs(RTID_ORDC, max_docs=150):
         try:
             df = _ercot_read_doc(d["id"])
             df.columns = df.columns.str.strip()
             frames.append(df)
         except Exception as e:  # noqa: BLE001
-            log.warning("ordc doc %s: %s", d["name"], e)
+            log.warning("ordc doc %s: %r", d["name"], e)
     if not frames:
         return pd.DataFrame()
     out = pd.concat(frames, ignore_index=True)
@@ -91,13 +100,13 @@ def fetch_ercot_ordc(hours: int) -> pd.DataFrame:
 
 def _ercot_spp(rtid: int, hubs_only: bool) -> pd.DataFrame:
     frames = []
-    for d in _ercot_docs(rtid, max_docs=3):
+    for d in _ercot_docs(rtid, max_docs=30):  # ~30 days of daily files
         try:
             df = _ercot_read_doc(d["id"])
             df.columns = df.columns.str.strip()
             frames.append(df)
         except Exception as e:  # noqa: BLE001
-            log.warning("spp doc %s: %s", d["name"], e)
+            log.warning("spp doc %s: %r", d["name"], e)
     if not frames:
         return pd.DataFrame()
     df = pd.concat(frames, ignore_index=True)
@@ -121,15 +130,23 @@ def fetch_ercot(hours: int) -> dict[str, pd.DataFrame]:
     start_d = (start - pd.Timedelta(days=1)).date()
     out: dict[str, pd.DataFrame] = {}
 
-    # DAM settlement-point prices (hub mean, hourly)
+    # DAM settlement-point prices (hub mean, hourly). location_type="Hub"
+    # silently empties post-RTC+B (Location Type values changed) — fetch ALL
+    # and filter by hub NAME instead.
     try:
         da = iso.get_spp(date=str(start_d), end=str(today),
-                         market="DAY_AHEAD_HOURLY", location_type="Hub")
+                         market="DAY_AHEAD_HOURLY")
         ts_col = next((c for c in ("Interval Start", "Time")
                        if c in da.columns), None)
         px_col = next((c for c in ("SPP", "LMP") if c in da.columns), None)
+        loc_col = next((c for c in ("Location", "Settlement Point")
+                        if c in da.columns), None)
         if da.empty or ts_col is None or px_col is None:
             raise ValueError(f"empty/missing cols: {list(da.columns)[:10]}")
+        if loc_col:
+            sub = da[da[loc_col].isin(ERCOT_HUBS)]
+            if not sub.empty:
+                da = sub
         s = (da.assign(ts_utc=pd.to_datetime(da[ts_col], utc=True))
                .groupby(pd.Grouper(key="ts_utc", freq="1h"))[px_col]
                .mean().dropna())
@@ -157,17 +174,23 @@ def fetch_ercot(hours: int) -> dict[str, pd.DataFrame]:
                     log.info("ercot_da direct: %d rows, cols=%s",
                              len(out["ercot_da"]), list(df.columns)[:10])
         except Exception as e2:  # noqa: BLE001
-            log.warning("ercot dam direct: %s", e2)
+            log.warning("ercot dam direct: %r", e2)
 
     # RTM settlement-point prices (hub mean, native 15-min)
     try:
         rt = iso.get_spp(date=str(start.date()), end=str(today),
-                         market="REAL_TIME_15_MIN", location_type="Hub")
+                         market="REAL_TIME_15_MIN")
         ts_col = next((c for c in ("Interval Start", "Time")
                        if c in rt.columns), None)
         px_col = next((c for c in ("SPP", "LMP") if c in rt.columns), None)
+        loc_col = next((c for c in ("Location", "Settlement Point")
+                        if c in rt.columns), None)
         if rt.empty or ts_col is None or px_col is None:
             raise ValueError(f"empty/missing cols: {list(rt.columns)[:10]}")
+        if loc_col:
+            sub = rt[rt[loc_col].isin(ERCOT_HUBS)]
+            if not sub.empty:
+                rt = sub
         out["ercot_rt"] = (rt.assign(
             ts_utc=pd.to_datetime(rt[ts_col], utc=True))
             .groupby(pd.Grouper(key="ts_utc", freq="15min"))[px_col]
@@ -190,7 +213,7 @@ def fetch_ercot(hours: int) -> dict[str, pd.DataFrame]:
                         .mean().dropna()
                         .rename("realtime_usd_mwh").reset_index())
         except Exception as e2:  # noqa: BLE001
-            log.warning("ercot rtm direct: %s", e2)
+            log.warning("ercot rtm direct: %r", e2)
 
     # ORDC adders + reserves — direct misapp (gridstatus handler broken
     # post-RTC+B)
@@ -229,18 +252,19 @@ def fetch_spp(hours: int) -> dict[str, pd.DataFrame]:
     # probe the file-browser listing API — post-RTC+B filenames 404 the
     # gridstatus patterns; the directory listing reveals the real names
     for fs in ("da-lmp-by-location", "rtbm-lmp-by-location"):
-        for ep in ("files-list", "list", "files"):
-            try:
-                r = requests.get(
-                    f"https://portal.spp.org/file-browser-api/{ep}",
-                    params={"path": "/2026/09/By_Day/", "fs": fs},
-                    timeout=20)
-                if r.ok and r.text.strip() not in ("", "[]"):
-                    log.info("spp listing %s/%s: %s", ep, fs,
-                             r.text[:600])
-                    break
-            except Exception as e:  # noqa: BLE001
-                log.debug("spp listing %s: %s", ep, e)
+        try:
+            r = requests.post(
+                "https://portal.spp.org/file-browser-api/file-browser",
+                json={"fs": fs, "path": "/", "type": "",
+                      "page": 1, "pageSize": 50, "sort": ""},
+                timeout=20)
+            if r.ok and r.text.strip() not in ("", "[]"):
+                log.info("spp listing fs=%s root: %s", fs, r.text[:800])
+            else:
+                log.info("spp listing fs=%s: status %s %s",
+                         fs, r.status_code, r.text[:200])
+        except Exception as e:  # noqa: BLE001
+            log.info("spp listing fs=%s: %r", fs, e)
 
     try:
         df = iso.get_lmp_day_ahead_hourly(date=str(start.date()),
