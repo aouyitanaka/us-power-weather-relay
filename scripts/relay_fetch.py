@@ -44,9 +44,10 @@ def _ercot_docs(rtid: int, max_docs: int = 6) -> list[dict]:
     out = []
     for d in docs[-max_docs:]:
         doc = d.get("Document", {})
-        did = doc.get("DocLookupId") or doc.get("DocumentId")
+        did = doc.get("DocID") or doc.get("DocLookupId")
         if did:
             out.append({"id": did, "name": doc.get("DocName", "")})
+    log.info("rtid %s: %d docs, using last %d", rtid, len(docs), len(out))
     return out
 
 
@@ -76,6 +77,7 @@ def fetch_ercot_ordc(hours: int) -> pd.DataFrame:
     if not frames:
         return pd.DataFrame()
     out = pd.concat(frames, ignore_index=True)
+    log.info("ordc raw: %d rows, cols=%s", len(out), list(out.columns)[:12])
     ts_col = next((c for c in out.columns if "SCED" in c or "Time" in c), None)
     if ts_col:
         # ERCOT stamps are US/Central local time
@@ -126,9 +128,13 @@ def fetch_ercot(hours: int) -> dict[str, pd.DataFrame]:
         ts_col = next((c for c in ("Interval Start", "Time")
                        if c in da.columns), None)
         px_col = next((c for c in ("SPP", "LMP") if c in da.columns), None)
+        if da.empty or ts_col is None or px_col is None:
+            raise ValueError(f"empty/missing cols: {list(da.columns)[:10]}")
         s = (da.assign(ts_utc=pd.to_datetime(da[ts_col], utc=True))
                .groupby(pd.Grouper(key="ts_utc", freq="1h"))[px_col]
                .mean().dropna())
+        if s.empty:
+            raise ValueError("hub-mean produced 0 rows")
         out["ercot_da"] = s.rename("day_ahead_usd_mwh").reset_index()
     except Exception as e:  # noqa: BLE001
         log.warning("ercot dam via get_spp: %s", e)
@@ -148,6 +154,8 @@ def fetch_ercot(hours: int) -> dict[str, pd.DataFrame]:
                         pd.Grouper(key="ts_utc", freq="1h"))[px]
                         .mean().dropna()
                         .rename("day_ahead_usd_mwh").reset_index())
+                    log.info("ercot_da direct: %d rows, cols=%s",
+                             len(out["ercot_da"]), list(df.columns)[:10])
         except Exception as e2:  # noqa: BLE001
             log.warning("ercot dam direct: %s", e2)
 
@@ -158,6 +166,8 @@ def fetch_ercot(hours: int) -> dict[str, pd.DataFrame]:
         ts_col = next((c for c in ("Interval Start", "Time")
                        if c in rt.columns), None)
         px_col = next((c for c in ("SPP", "LMP") if c in rt.columns), None)
+        if rt.empty or ts_col is None or px_col is None:
+            raise ValueError(f"empty/missing cols: {list(rt.columns)[:10]}")
         out["ercot_rt"] = (rt.assign(
             ts_utc=pd.to_datetime(rt[ts_col], utc=True))
             .groupby(pd.Grouper(key="ts_utc", freq="15min"))[px_col]
@@ -215,6 +225,22 @@ def fetch_spp(hours: int) -> dict[str, pd.DataFrame]:
     start = pd.Timestamp.now(tz="UTC") - pd.Timedelta(hours=hours)
     today = pd.Timestamp.now(tz="UTC").date()
     out = {}
+
+    # probe the file-browser listing API — post-RTC+B filenames 404 the
+    # gridstatus patterns; the directory listing reveals the real names
+    for fs in ("da-lmp-by-location", "rtbm-lmp-by-location"):
+        for ep in ("files-list", "list", "files"):
+            try:
+                r = requests.get(
+                    f"https://portal.spp.org/file-browser-api/{ep}",
+                    params={"path": "/2026/09/By_Day/", "fs": fs},
+                    timeout=20)
+                if r.ok and r.text.strip() not in ("", "[]"):
+                    log.info("spp listing %s/%s: %s", ep, fs,
+                             r.text[:600])
+                    break
+            except Exception as e:  # noqa: BLE001
+                log.debug("spp listing %s: %s", ep, e)
 
     try:
         df = iso.get_lmp_day_ahead_hourly(date=str(start.date()),
