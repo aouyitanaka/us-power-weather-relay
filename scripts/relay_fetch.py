@@ -300,7 +300,7 @@ def fetch_spp(hours: int) -> dict[str, pd.DataFrame]:
     return out
 
 
-def fetch_pjm_da(hours: int) -> pd.DataFrame:
+def _pjm_lmp(hours: int, market: str, col: str) -> pd.DataFrame:
     import gridstatus
 
     if not os.environ.get("PJM_API_KEY"):
@@ -310,7 +310,7 @@ def fetch_pjm_da(hours: int) -> pd.DataFrame:
     start = pd.Timestamp.now(tz="UTC") - pd.Timedelta(hours=hours)
     df = iso.get_lmp(date=str(start.date()),
                      end=str(pd.Timestamp.now(tz="UTC").date()),
-                     market="DAY_AHEAD_HOURLY")
+                     market=market)
     lt = next((c for c in ("Location Type",) if c in df.columns), None)
     if lt:
         sub = df[df[lt].isin({"HUB", "ZONE", "AGGREGATE", "Hub", "Zone"})]
@@ -321,7 +321,7 @@ def fetch_pjm_da(hours: int) -> pd.DataFrame:
     s = (df.assign(ts_utc=pd.to_datetime(df[ts_col], utc=True))
            .groupby(pd.Grouper(key="ts_utc", freq="1h"))["LMP"]
            .mean().dropna())
-    return s.rename("day_ahead_usd_mwh").reset_index()
+    return s.rename(col).reset_index()
 
 
 def _append_csv(path: str, new: pd.DataFrame, key: str = "ts_utc",
@@ -378,18 +378,22 @@ def main() -> None:
             _append_csv(f"{args.out}/{name}.csv", df)
             log.info("%s: %d rows", name, len(df))
 
-    try:
-        pjm = fetch_pjm_da(args.hours)
-        if not pjm.empty:
-            _append_csv(f"{args.out}/pjm_da.csv", pjm)
-            log.info("pjm_da: %d rows", len(pjm))
-    except Exception as e:  # noqa: BLE001
-        log.warning("pjm_da: %s", e)
+    for name, market, col in (("pjm_da", "DAY_AHEAD_HOURLY",
+                               "day_ahead_usd_mwh"),
+                              ("pjm_rt", "REAL_TIME_HOURLY",
+                               "realtime_usd_mwh")):
+        try:
+            pjm = _pjm_lmp(args.hours, market, col)
+            if not pjm.empty:
+                _append_csv(f"{args.out}/{name}.csv", pjm)
+                log.info("%s: %d rows", name, len(pjm))
+        except Exception as e:  # noqa: BLE001
+            log.warning("%s: %s", name, e)
 
     # merged <zone>.csv = the contract fetch_relay() reads (hourly DA+RT)
     for zone, da_f, rt_f in (("ercot", "ercot_da", "ercot_rt"),
                              ("spp", None, "spp_rt"),
-                             ("pjm", "pjm_da", None)):
+                             ("pjm", "pjm_da", "pjm_rt")):
         try:
             merged = _merge_zone(args.out, da_f, rt_f)
             if merged is not None and not merged.empty:
