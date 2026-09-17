@@ -261,6 +261,15 @@ def fetch_spp(hours: int) -> dict[str, pd.DataFrame]:
          f"/{d:%Y}/{d:%m}/By_Day/DA-LMP-SL-{d:%Y%m%d}0100.csv"),
         ("rtbm-lmp-by-location",
          f"/{d:%Y}/{d:%m}/By_Day/RTBM-LMP-DAILY-SL-{d:%Y%m%d}.csv"),
+        # By_Interval per-tick files (gridstatus pattern: /Y/M/By_Interval/DD/)
+        ("rtbm-lmp-by-location",
+         f"/{d:%Y}/{d:%m}/By_Interval/{d:%d}/RTBM-LMP-SL-{d:%Y%m%d%H%M}.csv"),
+        ("rtbm-lmp-by-location",
+         f"/{d:%Y}/{d:%m}/By_Interval/{d:%d}/RTBM-LMP-SL-"
+         f"{(d - pd.Timedelta(hours=1)):%Y%m%d%H%M}.csv"),
+        # DA-LMP dated file — maybe not under By_Day anymore
+        ("da-lmp-by-location",
+         f"/{d:%Y}/{d:%m}/DA-LMP-SL-{d:%Y%m%d}0100.csv"),
     ]
     for fs, p in probes:
         try:
