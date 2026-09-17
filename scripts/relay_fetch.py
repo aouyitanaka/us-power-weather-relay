@@ -250,21 +250,19 @@ def fetch_spp(hours: int) -> dict[str, pd.DataFrame]:
     out = {}
 
     # probe the file-browser listing API — post-RTC+B filenames 404 the
-    # gridstatus patterns; the directory listing reveals the real names
+    # gridstatus patterns; walk the tree to reveal the real names.
+    # correct shape (per gridstatus): GET {api}/{fs}?path={path}
     for fs in ("da-lmp-by-location", "rtbm-lmp-by-location"):
-        try:
-            r = requests.post(
-                "https://portal.spp.org/file-browser-api/file-browser",
-                json={"fs": fs, "path": "/", "type": "",
-                      "page": 1, "pageSize": 50, "sort": ""},
-                timeout=20)
-            if r.ok and r.text.strip() not in ("", "[]"):
-                log.info("spp listing fs=%s root: %s", fs, r.text[:800])
-            else:
-                log.info("spp listing fs=%s: status %s %s",
-                         fs, r.status_code, r.text[:200])
-        except Exception as e:  # noqa: BLE001
-            log.info("spp listing fs=%s: %r", fs, e)
+        for p in ("/", "/2026/", "/2026/09/", "/2026/09/By_Day/",
+                  "/2026/09/By_Day/16/", "/2026/09/By_Day/17/"):
+            try:
+                r = requests.get(
+                    f"https://portal.spp.org/file-browser-api/{fs}",
+                    params={"path": p}, timeout=20)
+                if r.ok and r.text.strip() not in ("", "[]", "{}"):
+                    log.info("spp fs=%s path=%s: %s", fs, p, r.text[:500])
+            except Exception as e:  # noqa: BLE001
+                log.info("spp fs=%s path=%s: %r", fs, p, e)
 
     try:
         df = iso.get_lmp_day_ahead_hourly(date=str(start.date()),
